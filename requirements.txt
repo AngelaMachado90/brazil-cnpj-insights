@@ -1,0 +1,9 @@
+streamlit
+pandas
+sqlalchemy
+psycopg2-binary
+plotly
+streamlit_plotly_events
+colorama
+graphviz
+streamlit-aggrid
