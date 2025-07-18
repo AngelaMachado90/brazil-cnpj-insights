@@ -63,7 +63,7 @@
 
 ```bash
 # Clone o repositório
-git clone https://github.com/seu-usuario/energy-analytics.git
+git clone https://github.com/AngelaMachado90/brazil-cnpj-insights.git
 
 # Inicie os containers
 docker-compose up -d
