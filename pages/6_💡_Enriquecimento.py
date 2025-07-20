@@ -1,43 +1,66 @@
 """
 Dashboard de Enriquecimento de Dados RFB + CCEE
 
-Este aplicativo fornece uma análise estratégica das empresas que realizaram a transição
-para o Mercado Livre de Energia, com dados integrados da Receita Federal e CCEE.
+Este aplicativo fornece uma análise estratégica das empresas que migraram para o Mercado Livre de Energia,
+integrando dados da Receita Federal do Brasil (RFB) e da Câmara de Comercialização de Energia Elétrica (CCEE).
 
-Funcionalidades principais:
-- Análise temporal da migração (últimos 1-10 anos)
+Principais funcionalidades:
+- Análise temporal da migração (1-10 anos)
 - Filtros por localização (UF/município), setor (CNAE) e porte
 - Detalhamento completo por empresa (CNPJ, contatos, sócios)
-- Visualização gráfica e exportação de dados
-- Monitoramento em tempo real da base de dados
+- Visualização gráfica interativa
+- Exportação de dados em CSV
+- Enriquecimento de dados via web scraping
+- Monitoramento em tempo real
 
-Requisitos:
-- Python 3.7+
-- Conexão PostgreSQL com dados RFB+CCEE
+Requisitos técnicos:
+- Python 3.9+
+- PostgreSQL 12+
+- Syt
 - Bibliotecas listadas em requirements.txt
 
+Arquitetura:
+- Frontend: Streamlit
+- Backend: Python (Pandas, Plotly, Psycopg2)
+- Banco de dados: PostgreSQL
+- Web scraping: BeautifulSoup/Selenium (script externo)
+
 Desenvolvido por:
-Angela Machado | Julho 2025 | Versão 2.1
+Angela Machado | Julho 2025 | Versão 3.0
 """
 
+# =============================================
+# IMPORTAÇÕES
+# =============================================
+import os
 import streamlit as st
+from streamlit.components.v1 import html
 import pandas as pd
 import psycopg2
 import plotly.express as px
 from datetime import datetime, timedelta
 import pytz
 import time
+import subprocess
 from contextlib import contextmanager
 from functools import wraps
 import logging
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, ColumnsAutoSizeMode
 
+
 # =============================================
 # CONFIGURAÇÃO INICIAL
 # =============================================
 
-# Configuração básica de logging
-logging.basicConfig(level=logging.INFO)
+# Configuração de logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler("dashboard.log"),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
 # Configuração do Streamlit
@@ -45,70 +68,150 @@ st.set_page_config(
     page_title="Dashboard Migração Mercado Livre",
     page_icon="⚡",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded",
+    menu_items={
+        'Get Help': 'https://github.com/seuuser/seurepo',
+        'Report a bug': "https://github.com/seuuser/seurepo/issues",
+        'About': "### Painel estratégico para análise de migração ao Mercado Livre de Energia"
+    }
 )
 
 # =============================================
-# CONSTANTES DE CONFIGURAÇÃO
+# CONSTANTES E CONFIGURAÇÕES
 # =============================================
 
+# Integracao com o bootstrap icone + botoes
+st.markdown("""
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+<style>
+    .btn-custom {
+        margin: 5px;
+        padding: 10px 15px;
+        border-radius: 8px;
+    }
+    .icon-header {
+        font-size: 1.2em;
+        margin-right: 8px;
+    }
+</style>
+""", unsafe_allow_html=True)
+
 class Config:
-    """Classe para armazenar configurações constantes do aplicativo"""
+    """Classe centralizada para configurações do aplicativo"""
     
-    # Configuração de timezone
+    # Configurações de timezone
     TIMEZONE = "America/Sao_Paulo"
+    DATE_FORMAT = "%d/%m/%Y %H:%M:%S"
     
-    # Configuração do banco de dados
+    # Configurações do banco de dados
     DB_CONFIG = {
         "host": "emewe-mailling-db",
         "database": "cnpj_receita",
         "user": "postgres",
         "password": "postgres",
-        "port": 5432
+        "port": 5432,
+        "connect_timeout": 5
     }
+    
+    # Configurações de caminhos
+    SCRAPING_SCRIPT_PATH = os.path.join(
+        os.path.dirname(__file__), 
+        "utils", 
+        "scraping", 
+        "extrair_contatos.py"
+    )
+    
+    # Configurações de cache
+    CACHE_TTL = 3600  # 1 hora em segundos
 
-# Início da contagem de tempo para monitoramento de performance
-tempo_inicio = time.time()
+# Início da contagem para monitoramento de performance
+APP_START_TIME = time.time()
 
 # =============================================
 # FUNÇÕES UTILITÁRIAS
 # =============================================
 
 def format_milhar(n: int) -> str:
-    """Formata número com separador de milhar."""
+    """
+    Formata número com separador de milhar.
+    
+    Args:
+        n: Número inteiro a ser formatado
+        
+    Returns:
+        String formatada com separador de milhar (ex: 1.000)
+    """
     return f"{n:,.0f}".replace(",", ".")
 
 def format_cnpj(cnpj: str) -> str:
-    """Formata CNPJ com máscara padrão (XX.XXX.XXX/XXXX-XX)."""
+    """
+    Formata CNPJ com máscara padrão (XX.XXX.XXX/XXXX-XX).
+    
+    Args:
+        cnpj: String contendo o CNPJ (com ou sem formatação)
+        
+    Returns:
+        String com CNPJ formatado
+    """
     cnpj = str(cnpj).zfill(14)
     return f"{cnpj[:2]}.{cnpj[2:5]}.{cnpj[5:8]}/{cnpj[8:12]}-{cnpj[12:14]}"
 
 def get_current_time() -> str:
-    """Retorna a data/hora atual formatada conforme timezone configurado."""
+    """
+    Obtém a data/hora atual formatada conforme timezone configurado.
+    
+    Returns:
+        String com data/hora formatada
+    """
     fuso = pytz.timezone(Config.TIMEZONE)
-    return datetime.now(fuso).strftime("%d/%m/%Y %H:%M:%S")
+    return datetime.now(fuso).strftime(Config.DATE_FORMAT)
 
 @contextmanager
 def get_db_connection():
-    """Gerenciador de contexto para conexões com o banco de dados."""
+    """
+    Gerenciador de contexto para conexões com o banco de dados.
+    
+    Yields:
+        Objeto de conexão com o banco de dados
+        
+    Raises:
+        Exception: Erro ao conectar ao banco de dados
+    """
     conn = None
     try:
         conn = psycopg2.connect(**Config.DB_CONFIG)
         conn.set_client_encoding('UTF8')
         yield conn
+    except Exception as e:
+        logger.error(f"Erro na conexão com o banco: {str(e)}")
+        st.error("Erro ao conectar ao banco de dados")
+        raise
     finally:
         if conn is not None:
             conn.close()
 
 def timing_decorator(func):
-    """Decorador para medir e exibir tempo de execução de funções."""
+    """
+    Decorador para medir e registrar tempo de execução de funções.
+    
+    Args:
+        func: Função a ser decorada
+        
+    Returns:
+        Função decorada com medição de tempo
+    """
     @wraps(func)
     def wrapper(*args, **kwargs):
         start_time = time.time()
+        logger.info(f"Iniciando execução de {func.__name__}")
+        
         with st.spinner(f"Executando {func.__name__}..."):
             result = func(*args, **kwargs)
         
         elapsed_time = time.time() - start_time
+        logger.info(f"{func.__name__} concluído em {elapsed_time:.2f}s")
         
         if elapsed_time > 1.0:
             st.toast(f"⏱️ {func.__name__} concluído em {elapsed_time:.2f}s", icon="✅")
@@ -127,129 +230,207 @@ def timing_decorator(func):
 # =============================================
 
 @st.cache_data(ttl=600, show_spinner="Carregando dados...")
-def fetch_data(query: str) -> pd.DataFrame:
-    """Executa consulta SQL e retorna DataFrame."""
-    with get_db_connection() as conn:
-        try:
-            df = pd.read_sql(query, conn)
-            return df
-        except Exception as e:
-            st.error(f"Erro ao executar consulta: {e}")
-            return pd.DataFrame()
+def fetch_data(query: str, params: tuple = None) -> pd.DataFrame:
+    """
+    Executa consulta SQL e retorna DataFrame.
+    
+    Args:
+        query: String com a consulta SQL
+        params: Parâmetros para consulta parametrizada
+        
+    Returns:
+        DataFrame com resultados da consulta
+        
+    Raises:
+        Exception: Erro ao executar consulta
+    """
+    try:
+        with get_db_connection() as conn:
+            return pd.read_sql(query, conn, params=params)
+    except Exception as e:
+        logger.error(f"Erro na consulta: {query[:100]}... - {str(e)}")
+        st.error(f"Erro ao executar consulta: {str(e)}")
+        return pd.DataFrame()
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=Config.CACHE_TTL)
 @timing_decorator
 def get_static_data() -> dict:
-    """Carrega dados estáticos para filtros."""
+    """
+    Carrega dados estáticos para filtros e configurações iniciais.
+    
+    Returns:
+        Dicionário com:
+        - ufs: Lista de UFs disponíveis
+        - municipios: DataFrame com municípios
+        - cnaes: DataFrame com códigos CNAE
+        - anos: Lista de anos disponíveis
+    """
     data = {
         "ufs": [],
         "municipios": pd.DataFrame(),
         "cnaes": pd.DataFrame(),
         "anos": []
     }
+    
     try:
+        # Carrega UFs
         data["ufs"] = fetch_data(
             "SELECT DISTINCT uf FROM rfb_estabelecimentos ORDER BY uf"
         )["uf"].dropna().tolist()
+        
+        # Carrega municípios
         data["municipios"] = fetch_data(
             "SELECT * FROM vw_municipios_com_estabelecimentos ORDER BY descricao"
         )
+        
+        # Carrega CNAEs
         data["cnaes"] = fetch_data(
-            "SELECT DISTINCT c.codigo, c.descricao FROM cnae_10 c ORDER BY c.codigo"
+            "SELECT codigo, descricao FROM cnae_10 ORDER BY codigo"
         )
+        
+        # Carrega anos disponíveis
         anos_df = fetch_data("""
             SELECT DISTINCT EXTRACT(YEAR FROM data_situacao_cadastral) AS ano
             FROM vw_estabelecimentos_empresas
             WHERE data_situacao_cadastral IS NOT NULL
             ORDER BY ano DESC
         """)
+        
         if not anos_df.empty:
             data["anos"] = anos_df['ano'].dropna().astype(int).tolist()
+            
     except Exception as e:
-        st.error(f"Erro ao carregar dados estáticos: {e}")
+        logger.error(f"Erro ao carregar dados estáticos: {str(e)}")
+        st.error(f"Erro ao carregar dados estáticos: {str(e)}")
+        
     return data
 
-@st.cache_data(ttl=3600)
+def initialize_session_state():
+    """Inicializa ou reinicializa o estado da sessão."""
+    default_state = {
+        'dados_carregados': False,
+        'carregamento_iniciado': False,
+        'static_data': None,
+        'df_migracao': None,
+        'df_empresas': None,
+        'data_importacao': None,
+        'total_empresas': None,
+        'cnae_options': ["Todos"],
+        'performance_logs': []
+    }
+    
+    for key, value in default_state.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+@st.cache_data(ttl=Config.CACHE_TTL)
 @timing_decorator
-def query_empresas_migradas(anos=5):
-    """Consulta empresas que migraram para o mercado livre."""
+def query_migracao_por_periodo(anos: int = 5) -> pd.DataFrame:
+    """
+    Consulta migrações agregadas por período mensal.
+    
+    Args:
+        anos: Número de anos para análise retroativa
+        
+    Returns:
+        DataFrame com colunas:
+        - ano_mes: Período no formato YYYY-MM
+        - quantidade_migracoes: Número de migrações no período
+    """
     try:
-        with get_db_connection() as conn:
-            query = f"""
-            WITH empresas_migradas AS (
-                SELECT DISTINCT c.cnpj_carga_padronizado AS cnpj, c.data_migracao
-                FROM ccee_parcela_carga_consumo_2025 c
-                WHERE c.data_migracao IS NOT NULL
-                AND c.data_migracao >= (CURRENT_DATE - INTERVAL '{anos} years')
-            )
+        query = """
+        WITH dados_migracao AS (
             SELECT 
-                em.cnpj AS "CNPJ",
-                es.nome_fantasia,
-                TO_CHAR(em.data_migracao, 'DD-MM-YYYY') AS "DATA_MIGRACAO",
-                TO_CHAR(em.data_migracao, 'YYYY-MM') AS "ANO_MES",
-                es.uf,
-                es.municipio,
-                es.cnae_fiscal_principal,
-                cn.descricao AS cnae_descricao,
-                es.email AS "EMAIL",
-                CASE 
-                    WHEN es.ddd1 IS NOT NULL AND es.telefone1 IS NOT NULL THEN CONCAT('(', es.ddd1, ') ', es.telefone1)
-                    WHEN es.ddd1 IS NULL AND es.telefone1 IS NOT NULL THEN es.telefone1
-                    ELSE NULL
-                END AS "TELEFONE01",
-                STRING_AGG(
-                    CASE WHEN s.nome_socio IS NOT NULL AND s.nome_socio != 'NÃO INFORMADO' THEN 
-                        CONCAT(s.nome_socio, ' (CPF/CNPJ: ', COALESCE(NULLIF(s.cnpj_cpf_socio, ''), 'Não informado'), ')')
-                    ELSE NULL END, 
-                    '; '
-                ) AS "SOCIOS"
-            FROM empresas_migradas em
-            JOIN rfb_estabelecimentos es ON em.cnpj = es.cnpj_completo
-            LEFT JOIN rfb_socios s ON SUBSTRING(em.cnpj, 1, 8) = s.cnpj_basico
-            JOIN aux_rfb_cnaes cn ON es.cnae_fiscal_principal = cn.codigo
-            GROUP BY em.cnpj, es.nome_fantasia, em.data_migracao, es.uf, es.municipio, 
-                    es.cnae_fiscal_principal, cn.descricao, es.email, es.ddd1, es.telefone1
-            """
-            df = pd.read_sql(query, conn)
-            return df
+                TO_CHAR(data_migracao, 'YYYY-MM') AS ano_mes,
+                COUNT(DISTINCT cnpj_carga) AS quantidade_migracoes,
+                0 AS eh_total
+            FROM ccee_parcela_carga_consumo_2025
+            WHERE data_migracao IS NOT NULL
+            AND data_migracao >= (CURRENT_DATE - INTERVAL %s)
+            GROUP BY TO_CHAR(data_migracao, 'YYYY-MM')
+            
+            UNION ALL
+            
+            SELECT 
+                'TOTAL' AS ano_mes,
+                COUNT(DISTINCT cnpj_carga) AS quantidade_migracoes,
+                1 AS eh_total
+            FROM ccee_parcela_carga_consumo_2025
+            WHERE data_migracao IS NOT NULL
+            AND data_migracao >= (CURRENT_DATE - INTERVAL %s)
+        )
+        SELECT ano_mes, quantidade_migracoes
+        FROM dados_migracao
+        ORDER BY eh_total, ano_mes;
+        """
+        
+        return fetch_data(query, (f"{anos} years", f"{anos} years"))
+        
     except Exception as e:
-        st.error(f"Erro ao consultar empresas migradas: {e}")
+        logger.error(f"Erro ao consultar migrações por período: {str(e)}")
+        st.error("Erro ao carregar dados de migração")
         return pd.DataFrame()
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=Config.CACHE_TTL)
 @timing_decorator
-def query_migracao_por_periodo(anos=5):
-    """Consulta migrações por período."""
+def query_empresas_migradas(anos: int = 5) -> pd.DataFrame:
+    """
+    Consulta empresas que migraram para o mercado livre.
+    
+    Args:
+        anos: Número de anos para análise retroativa
+        
+    Returns:
+        DataFrame com colunas:
+        - CNPJ, nome_fantasia, DATA_MIGRACAO, ANO_MES, uf, municipio
+        - cnae_fiscal_principal, cnae_descricao, EMAIL, TELEFONE01, SOCIOS
+    """
     try:
-        with get_db_connection() as conn:
-            query = f"""
-            WITH dados_migracao AS (
-                SELECT 
-                    TO_CHAR(data_migracao, 'YYYY-MM') AS ano_mes,
-                    COUNT(DISTINCT cnpj_carga) AS quantidade_migracoes,
-                    0 AS eh_total
-                FROM ccee_parcela_carga_consumo_2025
-                WHERE data_migracao IS NOT NULL
-                AND data_migracao >= (CURRENT_DATE - INTERVAL '{anos} years')
-                GROUP BY TO_CHAR(data_migracao, 'YYYY-MM')
-                UNION ALL
-                SELECT 'TOTAL' AS ano_mes,
-                    COUNT(DISTINCT cnpj_carga) AS quantidade_migracoes,
-                    1 AS eh_total
-                FROM ccee_parcela_carga_consumo_2025
-                WHERE data_migracao IS NOT NULL
-                AND data_migracao >= (CURRENT_DATE - INTERVAL '{anos} years')
-            )
-            SELECT ano_mes, quantidade_migracoes
-            FROM dados_migracao
-            ORDER BY eh_total, ano_mes;
-            """
-            df = pd.read_sql(query, conn)
-            return df
+        query = """
+        WITH empresas_migradas AS (
+            SELECT DISTINCT cnpj_carga_padronizado AS cnpj, data_migracao
+            FROM ccee_parcela_carga_consumo_2025
+            WHERE data_migracao IS NOT NULL
+            AND data_migracao >= (CURRENT_DATE - INTERVAL %s)
+        )
+        SELECT 
+            em.cnpj AS "CNPJ",
+            es.nome_fantasia,
+            TO_CHAR(em.data_migracao, 'DD-MM-YYYY') AS "DATA_MIGRACAO",
+            TO_CHAR(em.data_migracao, 'YYYY-MM') AS "ANO_MES",
+            es.uf,
+            es.municipio,
+            es.cnae_fiscal_principal,
+            cn.descricao AS cnae_descricao,
+            es.email AS "EMAIL",
+            CASE 
+                WHEN es.ddd1 IS NOT NULL AND es.telefone1 IS NOT NULL 
+                    THEN CONCAT('(', es.ddd1, ') ', es.telefone1)
+                WHEN es.ddd1 IS NULL AND es.telefone1 IS NOT NULL 
+                    THEN es.telefone1
+                ELSE NULL
+            END AS "TELEFONE01",
+            STRING_AGG(
+                CASE WHEN s.nome_socio IS NOT NULL AND s.nome_socio != 'NÃO INFORMADO' 
+                    THEN CONCAT(s.nome_socio, ' (CPF/CNPJ: ', 
+                               COALESCE(NULLIF(s.cnpj_cpf_socio, ''), 'Não informado'), ')')
+                ELSE NULL END, 
+                '; '
+            ) AS "SOCIOS"
+        FROM empresas_migradas em
+        JOIN rfb_estabelecimentos es ON em.cnpj = es.cnpj_completo
+        LEFT JOIN rfb_socios s ON SUBSTRING(em.cnpj, 1, 8) = s.cnpj_basico
+        JOIN aux_rfb_cnaes cn ON es.cnae_fiscal_principal = cn.codigo
+        GROUP BY em.cnpj, es.nome_fantasia, em.data_migracao, es.uf, es.municipio, 
+                es.cnae_fiscal_principal, cn.descricao, es.email, es.ddd1, es.telefone1
+        """
+        
+        return fetch_data(query, (f"{anos} years",))
+        
     except Exception as e:
-        st.error(f"Erro ao consultar migrações por período: {e}")
+        logger.error(f"Erro ao consultar empresas migradas: {str(e)}")
+        st.error("Erro ao carregar dados das empresas")
         return pd.DataFrame()
-
+    
 # =============================================
 # CONFIGURAÇÃO DO AGGRID
 # =============================================
@@ -330,10 +511,15 @@ def configure_aggrid(df, height=400, selection_mode="multiple", use_checkbox=Tru
 # =============================================
 # COMPONENTES DA INTERFACE
 # =============================================
-
+# funcao para filtros
 def setup_sidebar_filters(static_data):
     """Configura os filtros na sidebar."""
-    st.sidebar.header("Filtros Principais")
+    st.sidebar.markdown("""
+    <div class="d-flex align-items-center mb-3">
+        <i class="bi bi-funnel-fill me-2"></i>
+        <h5 class="mb-0">Filtros Principais</h5>
+    </div>
+    """, unsafe_allow_html=True)
     
     anos_analise = st.sidebar.slider(
         "Período de análise (anos)", 
@@ -344,17 +530,20 @@ def setup_sidebar_filters(static_data):
     visualizacao = st.sidebar.radio(
         "Tipo de visualização", 
         ["Gráfico de Linhas", "Barras Horizontais"],
+        format_func=lambda x: f"{'📈' if x == 'Gráfico de Linhas' else '📊'} {x}",
         help="Escolha como visualizar os dados"
     )
     
     porte_filtro = st.sidebar.selectbox(
         "Porte da empresa", 
-        ["Todos", "Micro Empresa", "Pequeno Porte", "Médio Porte", "Grande Porte"]
+        ["Todos", "Micro Empresa", "Pequeno Porte", "Médio Porte", "Grande Porte"],
+        format_func=lambda x: f"{'🏠' if x == 'Micro Empresa' else '🏢' if x == 'Grande Porte' else '🏛️'} {x}"
     )
     
     uf_filtro = st.sidebar.selectbox(
         "Unidade Federativa (UF)",
-        ["Todos"] + static_data["ufs"]
+        ["Todos"] + static_data["ufs"],
+        format_func=lambda x: f"{'🌎' if x == 'Todos' else '📍'} {x}"
     )
     
     return anos_analise, visualizacao, porte_filtro, uf_filtro
@@ -370,142 +559,76 @@ def show_metrics_cards(anos_analise):
         total_ultimos_anos = df_migracao[df_migracao['ano_mes'] != 'TOTAL']['quantidade_migracoes'].sum()
     else:
         total_ultimos_anos = 0
-
-    # CSS customizado para os cards
-    st.markdown("""
-    <style>
-        .card-container {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 20px;
-            margin: 20px 0;
-            justify-content: space-between;
-        }
-        .card {
-            width: 23%;
-            min-width: 200px;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            color: white !important;
-            border-radius: 15px;
-            padding: 20px;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-            text-align: center;
-            font-weight: bold;
-        }
-        .card-icon {
-            font-size: 40px;
-            margin-bottom: 10px;
-            color: white !important;
-        }
-        .card-label {
-            font-size: 18px;
-            color: #D1D5DB;
-            margin-bottom: 5px;
-        }
-        .card-value {
-            font-size: 32px;
-            color: white;
-        }
-        .text-explanation {
-            font-size: 20px;
-            line-height: 1.4;
-            margin-top: 8px;
-            padding: 6px 12px;
-            border-radius: 8px;
-            display: inline-block;
-            box-shadow: 0 1px 2px rgba(0,0,0,0.1);
-            font-style: italic;
-        }
     
-        /* Versão alternativa com ícone */
-        .text-explanation.with-icon {
-            padding-left: 30px;
-            position: relative;
-        }
-            
-        .text-explanation.with-icon:before {
-            content: "ℹ️";
-            position: absolute;
-            left: 8px;
-            top: 50%;
-            transform: translateY(-50%);
-        }
-            
-        /* Versão de destaque */
-        .text-explanation.highlight {
-            color: #1976d2;
-            border-left: 4px solid #1976d2;
-        }
-            
-        /* Versão minimalista */
-        .text-explanation.minimal {
-            background: transparent;
-            color: #666;
-            padding: 2px 0;
-            box-shadow: none;
-            font-style: normal;
-        }
-
-        @media (max-width: 1200px) {
-            .card {
-                width: 48%;
-            }
-        }
-        @media (max-width: 768px) {
-            .card {
-                width: 100%;
-            }
-        }
-    </style>
-    """, unsafe_allow_html=True)
-
-    # Carrega ícones Bootstrap
-    st.markdown(
-        '<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css">',
-        unsafe_allow_html=True
-    )
-
     # Dados para os cards
     agora = get_current_time()
     data_importacao = st.session_state.data_importacao.strftime('%d/%m/%Y') if st.session_state.data_importacao else "N/D"
     total_empresas = st.session_state.total_empresas
 
-
-    # Renderização dos cards
+       # Renderização dos cards com Bootstrap
     st.markdown(f"""
-    <div class="card-container">
-        <div class="card">
-            <div class="card-icon"><i class="bi bi-clock"></i></div>
-            <div class="card-label">Data Atual</div>
-            <div class="card-value">{agora}</div>
+    <div class="container mt-4">
+        <div class="row g-4">
+            <div class="col-md-3">
+                <div class="card h-100 shadow-sm">
+                    <div class="card-body text-center">
+                        <i class="bi bi-clock-fill text-primary fs-1 mb-3"></i>
+                        <h5 class="card-title">Data Atual</h5>
+                        <p class="card-text fs-4 fw-bold">{agora}</p>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="card h-100 shadow-sm">
+                    <div class="card-body text-center">
+                        <i class="bi bi-database-fill text-success fs-1 mb-3"></i>
+                        <h5 class="card-title">Última Importação</h5>
+                        <p class="card-text fs-4 fw-bold">{data_importacao}</p>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="card h-100 shadow-sm">
+                    <div class="card-body text-center">
+                        <i class="bi bi-building text-warning fs-1 mb-3"></i>
+                        <h5 class="card-title">Total Empresas</h5>
+                        <p class="card-text fs-4 fw-bold">{format_milhar(total_empresas)}</p>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3">
+                <div class="card h-100 shadow-sm">
+                    <div class="card-body text-center">
+                        <i class="bi bi-graph-up-arrow text-danger fs-1 mb-3"></i>
+                        <h5 class="card-title">Migrações ({anos_analise} anos)</h5>
+                        <p class="card-text fs-4 fw-bold">{format_milhar(total_ultimos_anos)}</p>
+                    </div>
+                </div>
+            </div>
         </div>
-        <div class="card">
-            <div class="card-icon"><i class="bi bi-database"></i></div>
-            <div class="card-label">Última Importação*</div>
-            <div class="card-value">{data_importacao}</div>
-        </div>
-        <div class="card">
-            <div class="card-icon"><i class="bi bi-building"></i></div>
-            <div class="card-label">Total Empresas Migradas</div>
-            <div class="card-value">{format_milhar(total_empresas)}</div>
-        </div>
-        <div class="card">
-            <div class="card-icon"><i class="bi bi-bar-chart-line"></i></div>
-            <div class="card-label">Migradas nos últimos anos**</div>
-            <div class="card-value">{format_milhar(total_ultimos_anos)}</div>
-        </div>
-        <div class="text-explanation">
-            <p> *A atualização depende da CCEE.<br>
-                Dados constantemente monitorados.</p
-            <p> **Empresas migradas para o Mercado Livre nos últimos {anos_analise} anos.</p>
-            <p>
+    </div>
+    <div class="alert alert-info mt-3" role="alert">
+        <i class="bi bi-info-circle-fill"></i> Dados atualizados constantemente. A atualização depende da CCEE.
+    </div>
+    """, unsafe_allow_html=True)
+    
+def show_migration_chart(anos_analise, visualizacao):
+    """Exibe o gráfico de evolução das migrações."""
+    st.markdown("""
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h2 class="mb-0"><i class="bi bi-graph-up icon-header"></i>Evolução das Migrações</h2>
+        <div class="btn-group" role="group">
+            <button class="btn btn-outline-primary {'active' if visualizacao == 'Gráfico de Linhas' else ''}" 
+                    onclick="parent.document.querySelector('input[type=radio][value=\"Gráfico de Linhas\"]').click()">
+                <i class="bi bi-line-chart"></i> Linhas
+            </button>
+            <button class="btn btn-outline-primary {'active' if visualizacao == 'Barras Horizontais' else ''}" 
+                    onclick="parent.document.querySelector('input[type=radio][value=\"Barras Horizontais\"]').click()">
+                <i class="bi bi-bar-chart"></i> Barras
+            </button>
         </div>
     </div>
     """, unsafe_allow_html=True)
-
-def show_migration_chart(anos_analise, visualizacao):
-    """Exibe o gráfico de evolução das migrações."""
-    st.subheader("📈 Evolução das Migrações")
     
     with st.spinner(f"Atualizando dados para {anos_analise} anos..."):
         df_migracao = query_migracao_por_periodo(anos_analise)
@@ -564,9 +687,43 @@ def show_migration_chart(anos_analise, visualizacao):
         st.warning("Nenhum dado encontrado com os filtros selecionados")
 
 def show_company_details(anos_analise, static_data):
-    """Exibe a tabela de detalhes das empresas."""
-    st.subheader("📋 Detalhes das Empresas Migradas")
+    """Exibe a tabela de detalhes das empresas com opção de enriquecimento."""
+    st.markdown("""
+    <div class="d-flex justify-content-between align-items-center mb-4">
+        <h2 class="mb-0"><i class="bi bi-table icon-header"></i>Detalhes das Empresas Migradas</h2>
+        <button class="btn btn-primary btn-lg" type="button" onclick="parent.document.querySelector('.stButton > button').click()">
+            <i class="bi bi-cloud-download"></i> Realizar Enriquecimento
+        </button>
+    </div>
+    """, unsafe_allow_html=True)
     
+    # Botão para enriquecimento de dados
+    if st.button("🔍 Realizar Enriquecimento", key="btn_enriquecimento", 
+                help="Executa o script para buscar contatos adicionais"):
+        try:
+            with st.spinner("Aguarde realizando o enriquecimento dos dados..."):
+                # Seleciona apenas CNPJ e Razão Social para enriquecimento
+                df_enriquecimento = st.session_state.df_empresas[['CNPJ', 'nome_fantasia']].copy()
+                
+                # Converte para lista de dicionários
+                empresas_para_enriquecer = df_enriquecimento.to_dict('records')
+                
+                # Chama a função de enriquecimento
+                resultado = processar_enriquecimento(empresas_para_enriquecer)
+                
+                if resultado['sucesso']:
+                    st.success("Enriquecimento realizado com sucesso!")
+                    st.info(f"{resultado['quantidade']} empresas enriquecidas")
+                    
+                    # Atualiza a tabela no banco de dados
+                    atualizar_banco_dados(resultado['dados'])
+                else:
+                    st.error("Erro ao executar enriquecimento:")
+                    st.error(resultado['erro'])
+        except Exception as e:
+            st.error(f"Falha ao executar enriquecimento: {str(e)}")
+    
+    # Filtros avançados
     with st.expander("🔍 Filtros Avançados", expanded=False):
         col1, col2, col3 = st.columns(3)
         with col1:
@@ -611,9 +768,10 @@ def show_company_details(anos_analise, static_data):
                 
                 df_empresas['CNPJ'] = df_empresas['CNPJ'].apply(format_cnpj)
                 
+                # Colunas para exibição (incluindo Razão Social)
                 cols_to_show = {
                     'CNPJ': 'CNPJ',
-                    'nome_fantasia': 'Nome Fantasia',
+                    'nome_fantasia': 'Razão Social',
                     'DATA_MIGRACAO': 'Data Migração',
                     'ANO_MES': 'Ano/Mês',
                     'uf': 'UF',
@@ -649,20 +807,148 @@ def show_company_details(anos_analise, static_data):
     except Exception as e:
         st.error(f"Erro ao consultar dados: {str(e)}")
 
+def processar_enriquecimento(empresas: list) -> dict:
+    """
+    Processa o enriquecimento de dados para uma lista de empresas.
+    
+    Args:
+        empresas: Lista de dicionários com CNPJ e Razão Social
+        
+    Returns:
+        Dicionário com:
+        - sucesso: bool indicando sucesso da operação
+        - quantidade: número de empresas processadas
+        - dados: lista de dicionários com dados enriquecidos
+        - erro: mensagem de erro (se houver)
+    """
+    resultados = []
+    
+    try:
+        for empresa in empresas:
+            cnpj = empresa['CNPJ']
+            razao_social = empresa['nome_fantasia']
+            
+            # Aqui você implementaria a lógica de scraping para cada empresa
+            # Exemplo fictício:
+            dados_enriquecidos = {
+                'cnpj': cnpj,
+                'razao_social': razao_social,
+                'telefones': ['+5511999999999'],
+                'emails': ['contato@empresa.com'],
+                'redes_sociais': {
+                    'linkedin': 'https://linkedin.com/company/empresa'
+                },
+                'data_processamento': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            }
+            
+            resultados.append(dados_enriquecidos)
+        
+        return {
+            'sucesso': True,
+            'quantidade': len(resultados),
+            'dados': resultados,
+            'erro': None
+        }
+        
+    except Exception as e:
+        return {
+            'sucesso': False,
+            'quantidade': 0,
+            'dados': [],
+            'erro': str(e)
+        }
+def criar_tabela_dados():
+    """Cria a tabela 'dados' no banco de dados se não existir."""
+    create_table_sql = """
+    CREATE TABLE IF NOT EXISTS dados (
+        id SERIAL PRIMARY KEY,
+        cnpj VARCHAR(14) NOT NULL,
+        razao_social VARCHAR(255),
+        telefones JSONB,
+        emails JSONB,
+        redes_sociais JSONB,
+        endereco TEXT,
+        data_processamento TIMESTAMP,
+        data_atualizacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        CONSTRAINT cnpj_unique UNIQUE (cnpj)
+    );
+    CREATE INDEX IF NOT EXISTS idx_dados_cnpj ON dados(cnpj);
+    """
+    
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                cursor.execute(create_table_sql)
+                conn.commit()
+        logger.info("Tabela 'dados' criada/verificada com sucesso")
+    except Exception as e:
+        logger.error(f"Erro ao criar tabela 'dados': {str(e)}")
+        raise
+
+def atualizar_banco_dados(dados: list):
+    """Atualiza o banco de dados com os dados enriquecidos."""
+    criar_tabela_dados()  # Garante que a tabela existe
+    
+    insert_sql = """
+    INSERT INTO dados (cnpj, razao_social, telefones, emails, redes_sociais, endereco, data_processamento)
+    VALUES (%s, %s, %s, %s, %s, %s, %s)
+    ON CONFLICT (cnpj) DO UPDATE
+    SET
+        razao_social = EXCLUDED.razao_social,
+        telefones = EXCLUDED.telefones,
+        emails = EXCLUDED.emails,
+        redes_sociais = EXCLUDED.redes_sociais,
+        endereco = EXCLUDED.endereco,
+        data_processamento = EXCLUDED.data_processamento,
+        data_atualizacao = CURRENT_TIMESTAMP
+    """
+    
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cursor:
+                for item in dados:
+                    cursor.execute(insert_sql, (
+                        item['cnpj'],
+                        item['razao_social'],
+                        json.dumps(item.get('telefones', [])),
+                        json.dumps(item.get('emails', [])),
+                        json.dumps(item.get('redes_sociais', {})),
+                        item.get('endereco', ''),
+                        item.get('data_processamento')
+                    ))
+                conn.commit()
+        logger.info(f"Dados de {len(dados)} empresas atualizados no banco")
+    except Exception as e:
+        logger.error(f"Erro ao atualizar banco de dados: {str(e)}")
+        raise
+            
 def show_footer():
     """Exibe o rodapé do dashboard."""
-    st.markdown("---")
-    st.markdown(f"""
-    <div style="text-align: center; color: gray;">
-        <strong> Fonte de Dados</strong><br>
-        <br>
-        <ul style="list-style:none; padding:0;">
-             <li><a href="https://www.gov.br/receitafederal/" target="_blank">RFB - Receita Federal do Brasil</a></li>
-             <li><a href="https://dadosabertos.ccee.org.br/dataset/parcela_carga_consumo/resource/c88d04a6-fe42-413b-b7bf-86e390494fb0" target="_blank">CCEE - Dados Aberto</a></li>
-        </ul>
-        <p>Última atualização: {get_current_time()}</p>
-        <p>Tempo total de processamento: {(time.time() - tempo_inicio):.2f} segundos</p>
-    </div>
+    st.markdown("""
+    <footer class="footer mt-5 py-3 bg-light">
+        <div class="container">
+            <div class="row">
+                <div class="col-md-6">
+                    <h5><i class="bi bi-database"></i> Fontes de Dados</h5>
+                    <ul class="list-unstyled">
+                        <li><a href="https://www.gov.br/receitafederal/" target="_blank" class="text-decoration-none">
+                            <i class="bi bi-box-arrow-up-right"></i> RFB - Receita Federal do Brasil</a></li>
+                        <li><a href="https://dadosabertos.ccee.org.br/dataset/parcela_carga_consumo/resource/c88d04a6-fe42-413b-b7bf-86e390494fb0" 
+                               target="_blank" class="text-decoration-none">
+                            <i class="bi bi-box-arrow-up-right"></i> CCEE - Dados Abertos</a></li>
+                    </ul>
+                </div>
+                <div class="col-md-6 text-end">
+                    <p><i class="bi bi-clock"></i> Última atualização: {get_current_time()}</p>
+                    <p><i class="bi bi-speedometer2"></i> Tempo de processamento: {(time.time() - tempo_inicio):.2f} segundos</p>
+                </div>
+            </div>
+            <hr>
+            <div class="text-center text-muted">
+                <p>Desenvolvido por Ariel Rosa da Luz | Julho 2025 | Versão 3.0</p>
+            </div>
+        </div>
+    </footer>
     """, unsafe_allow_html=True)
 
 # =============================================
@@ -671,6 +957,14 @@ def show_footer():
 
 def main():
     """Função principal do aplicativo."""
+    initialize_session_state()
+    
+    # Garante que a tabela de dados existe
+    try:
+        criar_tabela_dados()
+    except Exception as e:
+        st.error(f"Falha ao verificar tabela de dados: {str(e)}")
+        return
     
     # Inicialização do estado da sessão
     if 'dados_carregados' not in st.session_state:
@@ -745,39 +1039,44 @@ def main():
     """, unsafe_allow_html=True)
 
     # Carregamento inicial dos dados
+     # Carrega dados estáticos (sem UI)
     if not st.session_state.dados_carregados:
         if not st.session_state.carregamento_iniciado:
             st.session_state.carregamento_iniciado = True
             
             with st.spinner("🔍 Carregando dados iniciais..."):
-                # Carrega dados estáticos
-                st.session_state.static_data = get_static_data()
-                
-                # Prepara opções de CNAE
-                cnaes_df = st.session_state.static_data["cnaes"]
-                cnaes_df['descricao_resumida'] = cnaes_df['descricao'].str.slice(0, 40) + '...'
-                st.session_state.cnae_options = ["Todos"] + [
-                    f"{row['codigo']} - {row['descricao_resumida']}" 
-                    for _, row in cnaes_df.iterrows()
-                ]
-                
-                # Carrega dados de migração
-                st.session_state.df_migracao = query_migracao_por_periodo(5)
-                st.session_state.df_empresas = query_empresas_migradas(5)
-                
-                # Carrega metadados
-                data_importacao_df = fetch_data(
-                    "SELECT MAX(data_importacao) FROM ccee_parcela_carga_consumo_2025"
-                )
-                st.session_state.data_importacao = data_importacao_df.iloc[0][0] if not data_importacao_df.empty else None
-                
-                total_empresas_df = fetch_data(
-                    "SELECT COUNT(DISTINCT cnpj_carga) FROM ccee_parcela_carga_consumo_2025 WHERE data_migracao IS NOT NULL"
-                )
-                st.session_state.total_empresas = total_empresas_df.iloc[0][0] if not total_empresas_df.empty else 0
-                
-                st.session_state.dados_carregados = True
-                st.toast("✅ Dados carregados com sucesso!", icon="✅")
+                try:
+                    # Carrega dados estáticos brutos
+                    static_data_raw = get_static_data()
+                    
+                    # Prepara opções de CNAE (isso NÃO deve estar na função cacheada)
+                    cnaes_df = static_data_raw["cnaes"]
+                    cnaes_df['descricao_resumida'] = cnaes_df['descricao'].str.slice(0, 40) + '...'
+                    cnae_options = ["Todos"] + [
+                        f"{row['codigo']} - {row['descricao_resumida']}" 
+                        for _, row in cnaes_df.iterrows()
+                    ]
+                    
+                    # Atualiza o estado da sessão
+                    st.session_state.update({
+                        'static_data': static_data_raw,
+                        'cnae_options': cnae_options,
+                        'df_migracao': query_migracao_por_periodo(5),
+                        'df_empresas': query_empresas_migradas(5),
+                        'data_importacao': fetch_data(
+                            "SELECT MAX(data_importacao) FROM ccee_parcela_carga_consumo_2025"
+                        ).iloc[0][0],
+                        'total_empresas': fetch_data(
+                            "SELECT COUNT(DISTINCT cnpj_carga) FROM ccee_parcela_carga_consumo_2025 WHERE data_migracao IS NOT NULL"
+                        ).iloc[0][0],
+                        'dados_carregados': True
+                    })
+                    
+                    st.toast("✅ Dados carregados com sucesso!", icon="✅")
+                except Exception as e:
+                    st.error(f"Falha ao carregar dados: {str(e)}")
+                    st.session_state.carregamento_iniciado = False
+                    st.stop()
         else:
             st.warning("⌛ Aguarde, carregando dados...")
             st.stop()
